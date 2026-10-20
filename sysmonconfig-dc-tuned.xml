@@ -1,0 +1,690 @@
+﻿<!--
+  ICS Watch Dog - Active Directory / Domain Controller Sysmon Configuration
+  Version:      v2.3
+  Author:       ICS Watch Dog Project (https://icswatchdog.com)
+  Project:      https://github.com/cutaway-security/ICSWatchDog
+  Copyright:    (c) 2024-2026 Cutaway Security, LLC
+  License:      CC BY-SA 4.0 | Commercial licensing available (info@cutawaysecurity.com)
+
+  Minimum Sysmon:   v15+ (schema 4.90)
+  Target:           Windows Server Domain Controllers
+
+  (Upstream header retained in full below for attribution/CC BY-SA.)
+
+  SANS ICS 5 Critical Controls Supported:
+    #1 ICS Incident Response - Comprehensive DC forensic evidence (NTDS, SYSVOL, GPO changes)
+    #4 Secure Remote Access - Detection of known remote access / RMM tools
+    #5 Vulnerability Management - Software execution, driver loading, service change logging
+
+  ATTACKS SYSMON CANNOT DETECT ON DCs (use Windows Security Event Logs):
+    - DCSync: Requires Event ID 4662 with DS-Replication-Get-Changes GUIDs
+    - Golden Ticket: Requires Event ID 4769 (anomalous TGS requests)
+    - Kerberoasting: Requires Event ID 4769 (RC4 encryption type 0x17)
+    - DCShadow: Requires Event IDs 4742, 5136, 5137 (AD object changes)
+    - Account creation/modification: Requires Event IDs 4720, 4738
+    Ensure Windows Advanced Audit Policy is configured per CIS recommendations.
+
+  REFERENCES:
+    - Microsoft Sysmon: https://learn.microsoft.com/en-us/sysinternals/downloads/sysmon
+    - LOLBAS: https://lolbas-project.github.io
+    - (Full upstream reference list at https://github.com/cutaway-security/ICSWatchDog)
+-->
+
+<!--
+  ===========================================================================
+  LOCAL MODIFICATIONS (GMG / Suleyman) — applied on top of ICS Watch Dog v2.3
+  ===========================================================================
+  This is the design intent of the base config PLUS targeted hardening. The
+  base is a high-signal *tripwire* layer; full process telemetry on the DC
+  comes from Windows 4688 (keep it enabled — Sysmon does NOT backfill it).
+
+  Changes from upstream:
+   1. ProcessAccess exclude: added CrowdStrike Falcon (CSFalconService/
+      CSFalconContainer) and Elastic Endpoint so the EDR's own lsass access
+      is not logged as noise. ADD any backup/monitoring agent that reads lsass.
+   2. ProcessAccess exclude: added a benign GrantedAccess filter (0x1000/
+      0x1400/0x101000/0x101400 — masks WITHOUT PROCESS_VM_READ 0x10). This
+      drops query-only chatter while KEEPING the dump-capable masks
+      (0x1010/0x1410/0x143A/0x1F1FFF/0x1FFFFF) that indicate credential theft.
+   3. ImageLoad: enabled ONE high-value rule (rundll32 loading comsvcs.dll =
+      LSASS MiniDump). ImageLoad otherwise stays OFF to preserve low volume.
+   4. ProcessCreate: added a rename-resilient LOLBAS group keyed on
+      OriginalFileName (PE metadata survives binary rename) plus a few
+      binary-agnostic technique tokens (scrobj.dll, iex(new-object, ms-msdt:,
+      javascript:). These BACKSTOP — do not replace — the upstream Image-based
+      rules. OriginalFileName matching is case-insensitive; if a value is wrong
+      for your build the rule is simply inert (never harmful).
+   5. DriverLoad: exclusion now requires SignatureStatus=Valid, not just a
+      signer name containing Microsoft/Windows — tightens BYOVD coverage.
+
+  DEPLOYMENT NOTES FOR THIS ESTATE (BRAND-DC is single-FSMO — treat with care):
+   - Raise the Microsoft-Windows-Sysmon/Operational channel max size (default
+     64MB rolls fast on a DC); if it rolls before the Elastic Agent ships, and
+     the agent's "ignore events older than" window has passed, that loss is
+     permanent. Size it to several hundred MB.
+   - CheckRevocation=True needs CRL/OCSP reachable from the DC. If DC egress is
+     locked down (Cloudflare Zero Trust), set it False to avoid load latency.
+   - Test on a lab/non-FSMO DC first: reload with `sysmon -c sysmonconfig-dc-tuned.xml`
+     and watch the Operational event rate for an hour before production rollout.
+  ===========================================================================
+-->
+
+<Sysmon schemaversion="4.90">
+  <HashAlgorithms>md5,sha256,IMPHASH</HashAlgorithms>
+  <!-- CheckRevocation: checks loaded driver code-signing certificate revocation status.
+       Requires network access to CRL distribution points / OCSP responders.
+       Set to False if this system has no internet or restricted network access. -->
+  <CheckRevocation>True</CheckRevocation>
+
+  <EventFiltering>
+
+    <!--
+    ================================================================
+    EVENT ID 1: PROCESS CREATION [ProcessCreate]
+    ================================================================
+    -->
+    <RuleGroup name="ProcessCreate-Exclude" groupRelation="or">
+      <ProcessCreate onmatch="exclude">
+        <Image name="exclude=conhost system noise" condition="is">C:\Windows\System32\conhost.exe</Image>
+        <Image name="exclude=Windows Error Reporting" condition="is">C:\Windows\System32\WerFault.exe</Image>
+        <Image name="exclude=Windows Error Reporting (32-bit)" condition="is">C:\Windows\SysWOW64\WerFault.exe</Image>
+        <Image name="exclude=Windows Error Reporting manager" condition="is">C:\Windows\System32\wermgr.exe</Image>
+        <Image name="exclude=Software Protection Platform" condition="is">C:\Windows\System32\SppExtComObj.Exe</Image>
+        <Image name="exclude=Compatibility Telemetry" condition="is">C:\Windows\System32\CompatTelRunner.exe</Image>
+        <Image name="exclude=Windows Defender MsMpEng" condition="is">C:\Program Files\Windows Defender\MsMpEng.exe</Image>
+        <Image name="exclude=Windows Defender NisSrv" condition="is">C:\Program Files\Windows Defender\NisSrv.exe</Image>
+        <Image name="exclude=Windows Defender MpCmdRun" condition="is">C:\Program Files\Windows Defender\MpCmdRun.exe</Image>
+        <Image name="exclude=Windows Defender Platform MsMpEng" condition="is">C:\ProgramData\Microsoft\Windows Defender\Platform\MsMpEng.exe</Image>
+        <Image name="exclude=NET 4.0 64-bit mscorsvw" condition="is">C:\Windows\Microsoft.NET\Framework64\v4.0.30319\mscorsvw.exe</Image>
+        <Image name="exclude=NET 4.0 64-bit ngen" condition="is">C:\Windows\Microsoft.NET\Framework64\v4.0.30319\ngen.exe</Image>
+        <Image name="exclude=NET 4.0 32-bit mscorsvw" condition="is">C:\Windows\Microsoft.NET\Framework\v4.0.30319\mscorsvw.exe</Image>
+        <Image name="exclude=NET 4.0 32-bit ngen" condition="is">C:\Windows\Microsoft.NET\Framework\v4.0.30319\ngen.exe</Image>
+      </ProcessCreate>
+    </RuleGroup>
+
+    <!-- T1003.003 NTDS + T1087.002 Domain Account + T1003.006 DCSync -->
+    <RuleGroup name="ProcessCreate-DC-Detection" groupRelation="or">
+      <ProcessCreate onmatch="include">
+        <Image name="technique_id=T1003.003,technique=NTDS,detection=DC ntdsutil execution" condition="end with">\ntdsutil.exe</Image>
+        <Image name="technique_id=T1003.003,technique=NTDS,detection=DC vssadmin execution (shadow copy NTDS extraction vector)" condition="end with">\vssadmin.exe</Image>
+        <Image name="technique_id=T1003.003,technique=NTDS,detection=DC esentutl execution (NTDS database manipulation)" condition="end with">\esentutl.exe</Image>
+        <Image name="technique_id=T1003.003,technique=NTDS,detection=DC diskshadow execution (shadow copy NTDS extraction vector)" condition="end with">\diskshadow.exe</Image>
+        <CommandLine name="technique_id=T1003.003,technique=NTDS,detection=DC WMI shadow copy creation (NTDS extraction vector)" condition="contains">shadowcopy</CommandLine>
+        <Image name="technique_id=T1087.002,technique=Domain Account,detection=DC csvde AD data export" condition="end with">\csvde.exe</Image>
+        <Image name="technique_id=T1087.002,technique=Domain Account,detection=DC ldifde AD data export" condition="end with">\ldifde.exe</Image>
+        <CommandLine name="technique_id=T1003.006,technique=DCSync,detection=DC Mimikatz lsadump command line" condition="contains">lsadump</CommandLine>
+        <CommandLine name="technique_id=T1003.006,technique=DCSync,detection=DC secretsdump command line (impacket)" condition="contains">secretsdump</CommandLine>
+      </ProcessCreate>
+    </RuleGroup>
+
+    <!-- T1490 Inhibit System Recovery + T1562.001 Disable or Modify Tools -->
+    <RuleGroup name="ProcessCreate-RansomwareIndicators" groupRelation="or">
+      <ProcessCreate onmatch="include">
+        <CommandLine name="technique_id=T1490,technique=Inhibit System Recovery,detection=Ransomware shadow copy deletion via vssadmin" condition="contains">delete shadows</CommandLine>
+        <CommandLine name="technique_id=T1490,technique=Inhibit System Recovery,detection=Ransomware shadow copy deletion via WMI" condition="contains">shadowcopy delete</CommandLine>
+        <CommandLine name="technique_id=T1490,technique=Inhibit System Recovery,detection=Ransomware Windows recovery disabled via bcdedit" condition="contains">recoveryenabled no</CommandLine>
+        <CommandLine name="technique_id=T1490,technique=Inhibit System Recovery,detection=Ransomware boot status policy bypass via bcdedit" condition="contains">bootstatuspolicy ignoreallfailures</CommandLine>
+        <CommandLine name="technique_id=T1490,technique=Inhibit System Recovery,detection=Ransomware Windows backup catalog deletion via wbadmin" condition="contains">delete catalog</CommandLine>
+        <CommandLine name="technique_id=T1490,technique=Inhibit System Recovery,detection=Ransomware safe mode boot configuration" condition="contains">bcdedit /set safeboot</CommandLine>
+        <CommandLine name="technique_id=T1562.001,technique=Disable or Modify Tools,detection=Ransomware Defender realtime monitoring disabled" condition="contains">DisableRealtimeMonitoring $true</CommandLine>
+        <CommandLine name="technique_id=T1562.001,technique=Disable or Modify Tools,detection=Ransomware Defender path exclusion added" condition="contains">ExclusionPath</CommandLine>
+      </ProcessCreate>
+    </RuleGroup>
+
+    <!-- LOLBAS-CORE: Tier 1 (binary + command-line composite, low FP) -->
+    <RuleGroup name="ProcessCreate-LOLBAS-Core" groupRelation="or">
+      <ProcessCreate onmatch="include">
+        <Rule name="technique_id=T1105|T1140,technique=Ingress Tool Transfer,detection=certutil download via urlcache argument" groupRelation="and">
+          <Image condition="end with">\certutil.exe</Image>
+          <CommandLine condition="contains">urlcache</CommandLine>
+        </Rule>
+        <Rule name="technique_id=T1140,technique=Deobfuscate Decode Files,detection=certutil base64 decode of staged payload" groupRelation="and">
+          <Image condition="end with">\certutil.exe</Image>
+          <CommandLine condition="contains">-decode</CommandLine>
+        </Rule>
+        <Rule name="technique_id=T1218.005|T1105,technique=Mshta,detection=Mshta loading remote HTA over HTTP/HTTPS" groupRelation="and">
+          <Image condition="end with">\mshta.exe</Image>
+          <CommandLine condition="contains">http</CommandLine>
+        </Rule>
+        <Rule name="technique_id=T1218.010,technique=Regsvr32,detection=Squiblydoo regsvr32 remote scriptlet load" groupRelation="and">
+          <Image condition="end with">\regsvr32.exe</Image>
+          <CommandLine condition="contains">/i:http</CommandLine>
+        </Rule>
+        <Rule name="technique_id=T1197|T1105,technique=BITS Jobs,detection=bitsadmin transfer mode for file download" groupRelation="and">
+          <Image condition="end with">\bitsadmin.exe</Image>
+          <CommandLine condition="contains">/transfer</CommandLine>
+        </Rule>
+        <Rule name="technique_id=T1059.001|T1027,technique=PowerShell,detection=PowerShell encoded command long form on any PowerShell binary" groupRelation="and">
+          <Image condition="contains any">\powershell.exe;\pwsh.exe;\powershell_ise.exe</Image>
+          <CommandLine condition="contains">-encodedcommand</CommandLine>
+        </Rule>
+        <Rule name="technique_id=T1059.001|T1027,technique=PowerShell,detection=PowerShell encoded command short -enc form on any PowerShell binary" groupRelation="and">
+          <Image condition="contains any">\powershell.exe;\pwsh.exe;\powershell_ise.exe</Image>
+          <CommandLine condition="contains"> -enc </CommandLine>
+        </Rule>
+        <Rule name="technique_id=T1059.001|T1105,technique=PowerShell,detection=PowerShell Net.WebClient DownloadString stager on any PowerShell binary" groupRelation="and">
+          <Image condition="contains any">\powershell.exe;\pwsh.exe;\powershell_ise.exe</Image>
+          <CommandLine condition="contains">downloadstring</CommandLine>
+        </Rule>
+        <Rule name="technique_id=T1059.001,technique=PowerShell,detection=PowerShell IEX New-Object web cradle" groupRelation="and">
+          <Image condition="contains any">\powershell.exe;\pwsh.exe;\powershell_ise.exe</Image>
+          <CommandLine condition="contains">iex(new-object</CommandLine>
+        </Rule>
+        <Rule name="technique_id=T1059.001,technique=PowerShell,detection=PowerShell Invoke-Expression New-Object web cradle" groupRelation="and">
+          <Image condition="contains any">\powershell.exe;\pwsh.exe;\powershell_ise.exe</Image>
+          <CommandLine condition="contains">invoke-expression(new-object</CommandLine>
+        </Rule>
+        <Rule name="technique_id=T1220,technique=XSL Script Processing,detection=WMIC XSL stylesheet from URL via slash-format" groupRelation="and">
+          <Image condition="end with">\wmic.exe</Image>
+          <CommandLine condition="contains">/format:http</CommandLine>
+        </Rule>
+        <Rule name="technique_id=T1220,technique=XSL Script Processing,detection=WMIC XSL stylesheet from URL via format colon" groupRelation="and">
+          <Image condition="end with">\wmic.exe</Image>
+          <CommandLine condition="contains">format:&quot;http</CommandLine>
+        </Rule>
+        <Rule name="technique_id=T1047|T1021.003,technique=Windows Management Instrumentation,detection=WMIC remote target via /node: argument" groupRelation="and">
+          <Image condition="end with">\wmic.exe</Image>
+          <CommandLine condition="contains">/node:</CommandLine>
+        </Rule>
+        <Rule name="technique_id=T1047,technique=Windows Management Instrumentation,detection=WMIC process call create command" groupRelation="and">
+          <Image condition="end with">\wmic.exe</Image>
+          <CommandLine condition="contains">process call create</CommandLine>
+        </Rule>
+        <Rule name="technique_id=T1218.011|T1059.007,technique=Rundll32,detection=Rundll32 JavaScript URL handler execution" groupRelation="and">
+          <Image condition="end with">\rundll32.exe</Image>
+          <CommandLine condition="contains">javascript:</CommandLine>
+        </Rule>
+        <Rule name="technique_id=T1218,technique=System Binary Proxy Execution,detection=Follina msdt PCWDiagnostic exploit pattern" groupRelation="and">
+          <Image condition="end with">\msdt.exe</Image>
+          <CommandLine condition="contains">PCWDiagnostic</CommandLine>
+        </Rule>
+        <Rule name="technique_id=T1218,technique=System Binary Proxy Execution,detection=Follina ms-msdt URI scheme pattern" groupRelation="and">
+          <Image condition="end with">\msdt.exe</Image>
+          <CommandLine condition="contains">ms-msdt:</CommandLine>
+        </Rule>
+      </ProcessCreate>
+    </RuleGroup>
+
+    <!-- LOLBAS-ADVANCED: Tier 2 (broader, moderate FP; requires a tuning program) -->
+    <RuleGroup name="ProcessCreate-LOLBAS-Advanced" groupRelation="or">
+      <ProcessCreate onmatch="include">
+        <Rule name="technique_id=T1132|T1027,technique=Data Encoding,detection=certutil base64 encode of file (potential exfil staging)" groupRelation="and">
+          <Image condition="end with">\certutil.exe</Image>
+          <CommandLine condition="contains">-encode</CommandLine>
+        </Rule>
+        <Rule name="technique_id=T1218.005|T1059.005,technique=Mshta,detection=Mshta inline VBScript execution" groupRelation="and">
+          <Image condition="end with">\mshta.exe</Image>
+          <CommandLine condition="contains">vbscript:</CommandLine>
+        </Rule>
+        <Rule name="technique_id=T1218.005|T1059.007,technique=Mshta,detection=Mshta inline JavaScript execution" groupRelation="and">
+          <Image condition="end with">\mshta.exe</Image>
+          <CommandLine condition="contains">javascript:</CommandLine>
+        </Rule>
+        <Image name="technique_id=T1218.005,technique=Mshta,detection=Generic mshta.exe execution (binary-only detection)" condition="end with">\mshta.exe</Image>
+        <Image name="technique_id=T1197,technique=BITS Jobs,detection=Generic bitsadmin.exe execution" condition="end with">\bitsadmin.exe</Image>
+        <Rule name="technique_id=T1059.001|T1564.003,technique=PowerShell,detection=PowerShell hidden window with no profile flag" groupRelation="and">
+          <Image condition="contains any">\powershell.exe;\pwsh.exe;\powershell_ise.exe</Image>
+          <CommandLine condition="contains">-w hidden -nop</CommandLine>
+        </Rule>
+        <Rule name="technique_id=T1059.001|T1562.001,technique=PowerShell,detection=PowerShell execution policy bypass" groupRelation="and">
+          <Image condition="contains any">\powershell.exe;\pwsh.exe;\powershell_ise.exe</Image>
+          <CommandLine condition="contains">-ep bypass</CommandLine>
+        </Rule>
+        <Rule name="technique_id=T1059.001|T1564.001,technique=PowerShell,detection=PowerShell launched from AppData Temp directory" groupRelation="and">
+          <Image condition="contains">\AppData\Local\Temp\</Image>
+          <Image condition="contains any">\powershell.exe;\pwsh.exe;\powershell_ise.exe</Image>
+        </Rule>
+        <Rule name="technique_id=T1218.004,technique=InstallUtil,detection=InstallUtil uninstall mode (Squiblytwo abuse)" groupRelation="and">
+          <Image condition="end with">\InstallUtil.exe</Image>
+          <CommandLine condition="contains">/U</CommandLine>
+        </Rule>
+        <Image name="technique_id=T1218.009,technique=Regsvcs Regasm,detection=Generic regasm.exe execution" condition="end with">\RegAsm.exe</Image>
+        <Image name="technique_id=T1218.009,technique=Regsvcs Regasm,detection=Generic regsvcs.exe execution" condition="end with">\RegSvcs.exe</Image>
+        <Image name="technique_id=T1220,technique=XSL Script Processing,detection=Generic msxsl.exe execution" condition="end with">\msxsl.exe</Image>
+        <Rule name="technique_id=T1218.003,technique=CMSTP,detection=CMSTP installation with auto-update mode" groupRelation="and">
+          <Image condition="end with">\cmstp.exe</Image>
+          <CommandLine condition="contains">/au</CommandLine>
+        </Rule>
+        <Rule name="technique_id=T1218.003,technique=CMSTP,detection=CMSTP silent installation mode" groupRelation="and">
+          <Image condition="end with">\cmstp.exe</Image>
+          <CommandLine condition="contains">/s</CommandLine>
+        </Rule>
+        <Rule name="technique_id=T1218,technique=System Binary Proxy Execution,detection=wuauclt UpdateDeploymentProvider DLL sideload" groupRelation="and">
+          <Image condition="end with">\wuauclt.exe</Image>
+          <CommandLine condition="contains">/UpdateDeploymentProvider</CommandLine>
+        </Rule>
+        <Image name="technique_id=T1127.001,technique=MSBuild,detection=Generic msbuild.exe execution (tune for VS install paths)" condition="end with">\MSBuild.exe</Image>
+        <Rule name="technique_id=T1027.004,technique=Compile After Delivery,detection=csc.exe spawned by PowerShell parent process" groupRelation="and">
+          <Image condition="end with">\csc.exe</Image>
+          <ParentImage condition="contains any">\powershell.exe;\pwsh.exe;\powershell_ise.exe</ParentImage>
+        </Rule>
+        <Rule name="technique_id=T1027.004,technique=Compile After Delivery,detection=csc.exe spawned by cmd.exe parent process" groupRelation="and">
+          <Image condition="end with">\csc.exe</Image>
+          <ParentImage condition="end with">\cmd.exe</ParentImage>
+        </Rule>
+        <Image name="technique_id=T1055.001,technique=DLL Injection,detection=mavinject.exe DLL injection utility execution" condition="end with">\mavinject.exe</Image>
+        <Image name="technique_id=T1218,technique=System Binary Proxy Execution,detection=pcalua.exe Program Compatibility Assistant execution" condition="end with">\pcalua.exe</Image>
+        <Rule name="technique_id=T1059.003|T1218,technique=Windows Command Shell,detection=forfiles invoking cmd via command argument" groupRelation="and">
+          <Image condition="end with">\forfiles.exe</Image>
+          <CommandLine condition="contains">cmd</CommandLine>
+        </Rule>
+        <Image name="technique_id=T1105,technique=Ingress Tool Transfer,detection=finger.exe execution (rare legacy binary)" condition="end with">\finger.exe</Image>
+      </ProcessCreate>
+    </RuleGroup>
+
+    <!--
+    ================================================================
+    LOCAL MOD - LOLBAS-RENAME-RESILIENT
+    OriginalFileName (PE metadata) survives a binary rename; these backstop the
+    Image-based rules above. Case-insensitive match; an incorrect OriginalFileName
+    value just makes the rule inert, never harmful. The trailing binary-agnostic
+    CommandLine tokens catch the technique regardless of the host binary name
+    (safe on a DC where browsers/dev tools should not run).
+    ================================================================
+    -->
+    <RuleGroup name="ProcessCreate-LOLBAS-RenameResilient" groupRelation="or">
+      <ProcessCreate onmatch="include">
+        <Rule name="technique_id=T1105|T1140,technique=Ingress Tool Transfer,detection=certutil urlcache download (renamed binary)" groupRelation="and">
+          <OriginalFileName condition="is">CertUtil.exe</OriginalFileName>
+          <CommandLine condition="contains">urlcache</CommandLine>
+        </Rule>
+        <Rule name="technique_id=T1140,technique=Deobfuscate Decode Files,detection=certutil decode (renamed binary)" groupRelation="and">
+          <OriginalFileName condition="is">CertUtil.exe</OriginalFileName>
+          <CommandLine condition="contains">-decode</CommandLine>
+        </Rule>
+        <Rule name="technique_id=T1218.005|T1105,technique=Mshta,detection=mshta remote HTA (renamed binary)" groupRelation="and">
+          <OriginalFileName condition="is">MSHTA.EXE</OriginalFileName>
+          <CommandLine condition="contains">http</CommandLine>
+        </Rule>
+        <Rule name="technique_id=T1218.010,technique=Regsvr32,detection=Squiblydoo (renamed binary)" groupRelation="and">
+          <OriginalFileName condition="is">REGSVR32.EXE</OriginalFileName>
+          <CommandLine condition="contains">/i:http</CommandLine>
+        </Rule>
+        <Rule name="technique_id=T1197|T1105,technique=BITS Jobs,detection=bitsadmin transfer (renamed binary)" groupRelation="and">
+          <OriginalFileName condition="is">bitsadmin.exe</OriginalFileName>
+          <CommandLine condition="contains">/transfer</CommandLine>
+        </Rule>
+        <Rule name="technique_id=T1220,technique=XSL Script Processing,detection=wmic XSL from URL (renamed binary)" groupRelation="and">
+          <OriginalFileName condition="is">wmic.exe</OriginalFileName>
+          <CommandLine condition="contains">format:</CommandLine>
+        </Rule>
+        <Rule name="technique_id=T1047|T1021.003,technique=Windows Management Instrumentation,detection=wmic remote node (renamed binary)" groupRelation="and">
+          <OriginalFileName condition="is">wmic.exe</OriginalFileName>
+          <CommandLine condition="contains">/node:</CommandLine>
+        </Rule>
+        <Rule name="technique_id=T1218.004,technique=InstallUtil,detection=InstallUtil uninstall mode (renamed binary)" groupRelation="and">
+          <OriginalFileName condition="is">InstallUtil.exe</OriginalFileName>
+          <CommandLine condition="contains">/U</CommandLine>
+        </Rule>
+        <Rule name="technique_id=T1059.001|T1027,technique=PowerShell,detection=encoded command (renamed host)" groupRelation="and">
+          <OriginalFileName condition="is">PowerShell.EXE</OriginalFileName>
+          <CommandLine condition="contains any">-encodedcommand; -enc </CommandLine>
+        </Rule>
+        <Rule name="technique_id=T1059.001|T1105,technique=PowerShell,detection=DownloadString stager (renamed host)" groupRelation="and">
+          <OriginalFileName condition="is">PowerShell.EXE</OriginalFileName>
+          <CommandLine condition="contains">downloadstring</CommandLine>
+        </Rule>
+        <!-- Binary-agnostic technique tokens (survive ANY rename; inherently high-signal on a DC) -->
+        <CommandLine name="technique_id=T1218.010,technique=Regsvr32,detection=Squiblydoo scriptlet token (any binary)" condition="contains">scrobj.dll</CommandLine>
+        <CommandLine name="technique_id=T1059.001,technique=PowerShell,detection=IEX New-Object web cradle token (any binary)" condition="contains">iex(new-object</CommandLine>
+        <CommandLine name="technique_id=T1218,technique=System Binary Proxy Execution,detection=Follina ms-msdt URI token (any binary)" condition="contains">ms-msdt:</CommandLine>
+      </ProcessCreate>
+    </RuleGroup>
+
+    <!--
+    ================================================================
+    EVENT ID 2: FILE CREATION TIME CHANGED [FileCreateTime]
+    ================================================================
+    -->
+    <RuleGroup name="FileCreateTime" groupRelation="or">
+      <FileCreateTime onmatch="exclude">
+        <Image name="exclude=svchost timestamp updates" condition="is">C:\Windows\System32\svchost.exe</Image>
+        <Image name="exclude=msiexec install timestamp updates" condition="is">C:\Windows\System32\msiexec.exe</Image>
+      </FileCreateTime>
+    </RuleGroup>
+
+    <!--
+    ================================================================
+    EVENT ID 3: NETWORK CONNECTION [NetworkConnect]
+    Exclude-only (logs all connections minus the list). On a busy DC this is a
+    top volume source; lsass is intentionally retained to catch replication abuse.
+    Add exclusions here if volume bites on BRAND-DC.
+    ================================================================
+    -->
+    <RuleGroup name="NetworkConnect" groupRelation="or">
+      <NetworkConnect onmatch="exclude">
+        <Image name="exclude=svchost network noise" condition="is">C:\Windows\System32\svchost.exe</Image>
+        <Image name="exclude=Windows Defender MsMpEng network" condition="is">C:\Program Files\Windows Defender\MsMpEng.exe</Image>
+        <Image name="exclude=Windows Defender Platform MsMpEng network" condition="is">C:\ProgramData\Microsoft\Windows Defender\Platform\MsMpEng.exe</Image>
+        <Image name="exclude=WSMan provider host" condition="is">C:\Windows\System32\wsmprovhost.exe</Image>
+        <Image name="exclude=NET 4.0 64-bit mscorsvw network" condition="is">C:\Windows\Microsoft.NET\Framework64\v4.0.30319\mscorsvw.exe</Image>
+        <Image name="exclude=DC DNS server" condition="is">C:\Windows\System32\dns.exe</Image>
+        <!-- LOCAL MOD: EDR / agents generate benign outbound; exclude to control volume -->
+        <Image name="exclude=CrowdStrike Falcon service network" condition="is">C:\Program Files\CrowdStrike\CSFalconService.exe</Image>
+        <Image name="exclude=Elastic Agent network" condition="contains">\Elastic\Agent\</Image>
+        <!--
+        NOTE: lsass.exe is NOT excluded. On a DC, lsass handles Kerberos/LDAP
+        authentication; unexpected lsass connections may indicate DCSync or
+        replication abuse.
+        -->
+      </NetworkConnect>
+    </RuleGroup>
+
+    <!--
+    ================================================================
+    EVENT ID 5: PROCESS TERMINATED [ProcessTerminate]
+    ================================================================
+    -->
+    <RuleGroup name="ProcessTerminate" groupRelation="or">
+      <ProcessTerminate onmatch="exclude">
+        <Image name="exclude=conhost termination noise" condition="is">C:\Windows\System32\conhost.exe</Image>
+      </ProcessTerminate>
+    </RuleGroup>
+
+    <!--
+    ================================================================
+    EVENT ID 6: DRIVER LOADED [DriverLoad]
+    LOCAL MOD: exclude only VALID-signed MS/Windows drivers (BYOVD hardening).
+    ================================================================
+    -->
+    <RuleGroup name="DriverLoad" groupRelation="or">
+      <DriverLoad onmatch="exclude">
+        <Rule name="exclude=Microsoft signed and valid" groupRelation="and">
+          <Signature condition="contains">Microsoft</Signature>
+          <SignatureStatus condition="is">Valid</SignatureStatus>
+        </Rule>
+        <Rule name="exclude=Windows signed and valid" groupRelation="and">
+          <Signature condition="contains">Windows</Signature>
+          <SignatureStatus condition="is">Valid</SignatureStatus>
+        </Rule>
+      </DriverLoad>
+    </RuleGroup>
+
+    <!--
+    ================================================================
+    EVENT ID 7: IMAGE LOADED [ImageLoad]
+    LOCAL MOD: otherwise OFF (volume). One high-value DC rule enabled:
+    rundll32 loading comsvcs.dll = LSASS MiniDump export.
+    ================================================================
+    -->
+    <RuleGroup name="ImageLoad" groupRelation="or">
+      <ImageLoad onmatch="include">
+        <Rule name="technique_id=T1003.001,technique=LSASS Memory,detection=comsvcs.dll MiniDump export loaded by rundll32" groupRelation="and">
+          <Image condition="end with">\rundll32.exe</Image>
+          <ImageLoaded condition="end with">\comsvcs.dll</ImageLoaded>
+        </Rule>
+      </ImageLoad>
+    </RuleGroup>
+
+    <!--
+    ================================================================
+    EVENT ID 8: CREATE REMOTE THREAD [CreateRemoteThread]
+    ================================================================
+    -->
+    <RuleGroup name="CreateRemoteThread" groupRelation="or">
+      <CreateRemoteThread onmatch="exclude">
+        <SourceImage name="exclude=csrss legitimate remote thread" condition="is">C:\Windows\System32\csrss.exe</SourceImage>
+        <SourceImage name="exclude=wininit legitimate remote thread" condition="is">C:\Windows\System32\wininit.exe</SourceImage>
+        <SourceImage name="exclude=winlogon legitimate remote thread" condition="is">C:\Windows\System32\winlogon.exe</SourceImage>
+        <SourceImage name="exclude=services legitimate remote thread" condition="is">C:\Windows\System32\services.exe</SourceImage>
+        <SourceImage name="exclude=lsass legitimate remote thread" condition="is">C:\Windows\System32\lsass.exe</SourceImage>
+        <SourceImage name="exclude=svchost legitimate remote thread" condition="is">C:\Windows\System32\svchost.exe</SourceImage>
+      </CreateRemoteThread>
+    </RuleGroup>
+
+    <!--
+    ================================================================
+    EVENT ID 9: RAW ACCESS READ [RawAccessRead]
+    DC-SPECIFIC: ENABLED (NTDS.dit raw-disk extraction, e.g. Invoke-NinjaCopy).
+    MITRE ATT&CK: T1003.003 (NTDS)
+    ================================================================
+    -->
+    <RuleGroup name="RawAccessRead" groupRelation="or">
+      <RawAccessRead onmatch="exclude">
+        <Image name="exclude=svchost raw disk read" condition="is">C:\Windows\System32\svchost.exe</Image>
+        <Image name="exclude=Virtual Disk Service raw read" condition="is">C:\Windows\System32\vds.exe</Image>
+        <Image name="exclude=Volume Shadow Copy Service raw read" condition="is">C:\Windows\System32\vssvc.exe</Image>
+      </RawAccessRead>
+    </RuleGroup>
+
+    <!--
+    ================================================================
+    EVENT ID 10: PROCESS ACCESS [ProcessAccess]
+    T1003.001 LSASS Memory. Include = any access to lsass; excludes below strip
+    the legitimate DC accessors, EDR/agents, and benign (non-VM_READ) masks.
+    ================================================================
+    -->
+    <RuleGroup name="ProcessAccess" groupRelation="or">
+      <ProcessAccess onmatch="include">
+        <TargetImage name="technique_id=T1003.001,technique=LSASS Memory,detection=Process accessing lsass.exe on DC" condition="is">C:\Windows\System32\lsass.exe</TargetImage>
+      </ProcessAccess>
+    </RuleGroup>
+
+    <RuleGroup name="ProcessAccess-DC-Exclude" groupRelation="or">
+      <ProcessAccess onmatch="exclude">
+        <!-- DC processes that legitimately access LSASS constantly -->
+        <SourceImage name="exclude=csrss DC LSASS access" condition="is">C:\Windows\System32\csrss.exe</SourceImage>
+        <SourceImage name="exclude=services DC LSASS access" condition="is">C:\Windows\System32\services.exe</SourceImage>
+        <SourceImage name="exclude=svchost DC LSASS access" condition="is">C:\Windows\System32\svchost.exe</SourceImage>
+        <SourceImage name="exclude=lsass self access" condition="is">C:\Windows\System32\lsass.exe</SourceImage>
+        <SourceImage name="exclude=winlogon DC LSASS access" condition="is">C:\Windows\System32\winlogon.exe</SourceImage>
+        <SourceImage name="exclude=wininit DC LSASS access" condition="is">C:\Windows\System32\wininit.exe</SourceImage>
+        <SourceImage name="exclude=DC DNS server LSASS access" condition="is">C:\Windows\System32\dns.exe</SourceImage>
+        <SourceImage name="exclude=DC DFSR LSASS access" condition="is">C:\Windows\System32\dfsr.exe</SourceImage>
+        <SourceImage name="exclude=DC NTFRS LSASS access" condition="is">C:\Windows\System32\ntfrs.exe</SourceImage>
+        <SourceImage name="exclude=DC Intersite Messaging LSASS access" condition="is">C:\Windows\System32\ismserv.exe</SourceImage>
+        <SourceImage name="exclude=AD Web Services LSASS access" condition="is">C:\Windows\ADWS\Microsoft.ActiveDirectory.WebServices.exe</SourceImage>
+        <SourceImage name="exclude=Windows Defender MsMpEng LSASS access" condition="is">C:\Program Files\Windows Defender\MsMpEng.exe</SourceImage>
+        <SourceImage name="exclude=Windows Defender Platform MsMpEng LSASS access" condition="is">C:\ProgramData\Microsoft\Windows Defender\Platform\MsMpEng.exe</SourceImage>
+        <!-- LOCAL MOD: EDR / agents open handles to lsass as part of normal operation -->
+        <SourceImage name="exclude=CrowdStrike Falcon service LSASS access" condition="is">C:\Program Files\CrowdStrike\CSFalconService.exe</SourceImage>
+        <SourceImage name="exclude=CrowdStrike Falcon container LSASS access" condition="is">C:\Program Files\CrowdStrike\CSFalconContainer.exe</SourceImage>
+        <SourceImage name="exclude=Elastic Endpoint LSASS access" condition="end with">\Elastic\Endpoint\elastic-endpoint.exe</SourceImage>
+        <!-- LOCAL MOD: benign access masks (NO PROCESS_VM_READ 0x10) — drop query-only noise.
+             KEPT (will still log): 0x1010, 0x1410, 0x143A, 0x1F1FFF, 0x1FFFFF (dump-capable). -->
+        <GrantedAccess name="exclude=benign query-limited information" condition="is">0x1000</GrantedAccess>
+        <GrantedAccess name="exclude=benign query information" condition="is">0x1400</GrantedAccess>
+        <GrantedAccess name="exclude=benign synchronize+query-limited" condition="is">0x101000</GrantedAccess>
+        <GrantedAccess name="exclude=benign synchronize+query" condition="is">0x101400</GrantedAccess>
+        <!--
+        IMPORTANT: Add your AD management, monitoring, and BACKUP agent exclusions here
+        (SCCM/MECM client, backup agent reading lsass, inventory tools).
+        -->
+      </ProcessAccess>
+    </RuleGroup>
+
+    <!--
+    ================================================================
+    EVENT ID 11: FILE CREATED [FileCreate]
+    ================================================================
+    -->
+    <RuleGroup name="FileCreate" groupRelation="or">
+      <FileCreate onmatch="include">
+        <TargetFilename name="technique_id=T1547.001,technique=Registry Run Keys / Startup Folder,detection=File created in Start Menu" condition="contains">\Start Menu</TargetFilename>
+        <TargetFilename name="technique_id=T1547.001,technique=Registry Run Keys / Startup Folder,detection=File created in Startup folder" condition="contains">\Startup</TargetFilename>
+        <TargetFilename name="technique_id=T1053.005,technique=Scheduled Task,detection=Scheduled task XML created in Tasks directory" condition="contains">\Windows\System32\Tasks</TargetFilename>
+        <TargetFilename name="technique_id=T1204.002,technique=Malicious File,detection=Executable file created" condition="end with">.exe</TargetFilename>
+        <TargetFilename name="technique_id=T1574.002,technique=DLL Side-Loading,detection=DLL file created" condition="end with">.dll</TargetFilename>
+        <TargetFilename name="technique_id=T1543.003|T1014,technique=Windows Service,detection=System driver (.sys) file created" condition="end with">.sys</TargetFilename>
+        <TargetFilename name="technique_id=T1059.003,technique=Windows Command Shell,detection=Batch script created" condition="end with">.bat</TargetFilename>
+        <TargetFilename name="technique_id=T1059.003,technique=Windows Command Shell,detection=Command script created" condition="end with">.cmd</TargetFilename>
+        <TargetFilename name="technique_id=T1059.001,technique=PowerShell,detection=PowerShell script created" condition="end with">.ps1</TargetFilename>
+        <TargetFilename name="technique_id=T1059.005,technique=Visual Basic,detection=VBScript file created" condition="end with">.vbs</TargetFilename>
+        <TargetFilename name="technique_id=T1059.007,technique=JavaScript,detection=JavaScript file created" condition="end with">.js</TargetFilename>
+        <TargetFilename name="technique_id=T1059.005,technique=Visual Basic,detection=Windows Script File created" condition="end with">.wsf</TargetFilename>
+        <TargetFilename name="technique_id=T1218.005,technique=Mshta,detection=HTML Application file created" condition="end with">.hta</TargetFilename>
+        <TargetFilename name="technique_id=T1546.002,technique=Screensaver,detection=Screensaver executable created" condition="end with">.scr</TargetFilename>
+        <TargetFilename name="technique_id=T1218.007,technique=Msiexec,detection=MSI installer file created" condition="end with">.msi</TargetFilename>
+        <TargetFilename name="technique_id=T1105,technique=Ingress Tool Transfer,detection=File created in user AppData Temp folder" condition="contains">\AppData\Local\Temp\</TargetFilename>
+        <TargetFilename name="technique_id=T1105,technique=Ingress Tool Transfer,detection=File created in ProgramData folder" condition="contains">\ProgramData\</TargetFilename>
+        <TargetFilename name="technique_id=T1105,technique=Ingress Tool Transfer,detection=File created in Windows Temp folder" condition="contains">\Windows\Temp\</TargetFilename>
+        <TargetFilename name="technique_id=T1564.001,technique=Hidden Files and Directories,detection=File staged in Recycle Bin" condition="contains">\$Recycle.Bin\</TargetFilename>
+        <TargetFilename name="technique_id=T1484.001,technique=Group Policy Modification,detection=Group Policy file modified" condition="contains">\GroupPolicy\</TargetFilename>
+        <TargetFilename name="technique_id=T1003.003,technique=NTDS,detection=File created in NTDS directory" condition="contains">\Windows\NTDS\</TargetFilename>
+        <TargetFilename name="technique_id=T1003.003,technique=NTDS,detection=NTDS.dit file copy created" condition="end with">.dit</TargetFilename>
+        <TargetFilename name="technique_id=T1003.002,technique=Security Account Manager,detection=Registry hive (.hive) export created" condition="end with">.hive</TargetFilename>
+        <TargetFilename name="technique_id=T1003.002,technique=Security Account Manager,detection=SAM hive copy from System32 config" condition="contains">\Windows\System32\config\SAM</TargetFilename>
+        <TargetFilename name="technique_id=T1003.002,technique=Security Account Manager,detection=SYSTEM hive copy from System32 config" condition="contains">\Windows\System32\config\SYSTEM</TargetFilename>
+        <TargetFilename name="technique_id=T1003.004,technique=LSA Secrets,detection=SECURITY hive copy from System32 config" condition="contains">\Windows\System32\config\SECURITY</TargetFilename>
+        <TargetFilename name="technique_id=T1484.001,technique=Group Policy Modification,detection=File created in SYSVOL" condition="contains">\Windows\SYSVOL\</TargetFilename>
+        <TargetFilename name="technique_id=T1484.001|T1053.005,technique=Group Policy Modification,detection=GPO ScheduledTasks XML modified" condition="end with">ScheduledTasks.xml</TargetFilename>
+        <TargetFilename name="technique_id=T1484.001,technique=Group Policy Modification,detection=GPO GptTmpl.inf modified" condition="end with">GptTmpl.inf</TargetFilename>
+        <TargetFilename name="technique_id=T1484.001,technique=Group Policy Modification,detection=GPO registry.pol modified" condition="end with">registry.pol</TargetFilename>
+      </FileCreate>
+    </RuleGroup>
+
+    <!--
+    ================================================================
+    EVENT ID 12, 13, 14: REGISTRY EVENTS [RegistryEvent]
+    ================================================================
+    -->
+    <RuleGroup name="RegistryEvent" groupRelation="or">
+      <RegistryEvent onmatch="include">
+        <TargetObject name="technique_id=T1547.001,technique=Registry Run Keys / Startup Folder,detection=Registry Run key modified" condition="contains">\CurrentVersion\Run</TargetObject>
+        <TargetObject name="technique_id=T1547.001,technique=Registry Run Keys / Startup Folder,detection=Registry RunOnce key modified" condition="contains">\CurrentVersion\RunOnce</TargetObject>
+        <TargetObject name="technique_id=T1547.001,technique=Registry Run Keys / Startup Folder,detection=RunServices key modified" condition="contains">\CurrentVersion\RunServices</TargetObject>
+        <TargetObject name="technique_id=T1547.001,technique=Registry Run Keys / Startup Folder,detection=Explorer Policies Run key modified" condition="contains">\CurrentVersion\Policies\Explorer\Run</TargetObject>
+        <TargetObject name="technique_id=T1543.003,technique=Windows Service,detection=Windows service registry key modified" condition="contains">\CurrentControlSet\Services</TargetObject>
+        <TargetObject name="technique_id=T1053.005,technique=Scheduled Task,detection=Scheduled task cache modified" condition="contains">\Schedule\TaskCache</TargetObject>
+        <TargetObject name="technique_id=T1546.010,technique=AppInit DLLs,detection=AppInit_DLLs registry value modified" condition="contains">\Windows NT\CurrentVersion\Windows\AppInit_DLLs</TargetObject>
+        <TargetObject name="technique_id=T1546.012,technique=Image File Execution Options Injection,detection=IFEO registry key modified" condition="contains">\CurrentVersion\Image File Execution Options</TargetObject>
+        <TargetObject name="technique_id=T1547.004,technique=Winlogon Helper DLL,detection=Winlogon Shell value modified" condition="contains">\Microsoft\Windows NT\CurrentVersion\Winlogon\Shell</TargetObject>
+        <TargetObject name="technique_id=T1547.004,technique=Winlogon Helper DLL,detection=Winlogon Userinit value modified" condition="contains">\Microsoft\Windows NT\CurrentVersion\Winlogon\Userinit</TargetObject>
+        <TargetObject name="technique_id=T1562.001,technique=Disable or Modify Tools,detection=AppLocker policy modified" condition="contains">\Policies\Microsoft\Windows\SrpV2</TargetObject>
+        <TargetObject name="technique_id=T1556,technique=Modify Authentication Process,detection=LSA configuration modified" condition="contains">\CurrentControlSet\Control\Lsa</TargetObject>
+        <TargetObject name="technique_id=T1556,technique=Modify Authentication Process,detection=Security providers registry modified" condition="contains">\Control\SecurityProviders</TargetObject>
+        <TargetObject name="technique_id=T1543.003,technique=Windows Service,detection=LanmanServer service configuration modified" condition="contains">\Services\LanmanServer</TargetObject>
+        <TargetObject name="technique_id=T1003.003,technique=NTDS,detection=NTDS service configuration modified" condition="contains">\Services\NTDS\</TargetObject>
+        <TargetObject name="technique_id=T1556,technique=Modify Authentication Process,detection=Netlogon service configuration modified" condition="contains">\Services\Netlogon\</TargetObject>
+        <TargetObject name="technique_id=T1543.003,technique=Windows Service,detection=DNS service configuration modified on DC" condition="contains">\Services\DNS\</TargetObject>
+        <TargetObject name="technique_id=T1543.003,technique=Windows Service,detection=DFSR service configuration modified" condition="contains">\Services\DFSR\</TargetObject>
+        <TargetObject name="technique_id=T1543.003,technique=Windows Service,detection=NTFRS service configuration modified" condition="contains">\Services\NtFrs\</TargetObject>
+        <TargetObject name="technique_id=T1556,technique=Modify Authentication Process,detection=Kerberos configuration modified" condition="contains">\Control\Lsa\Kerberos</TargetObject>
+        <TargetObject name="technique_id=T1490,technique=Inhibit System Recovery,detection=SafeBoot configuration modified" condition="contains">\Control\SafeBoot</TargetObject>
+        <TargetObject name="technique_id=T1112|T1003.001,technique=Modify Registry,detection=WDigest credential caching enabled" condition="contains">\SecurityProviders\WDigest</TargetObject>
+        <TargetObject name="technique_id=T1562.001,technique=Disable or Modify Tools,detection=Windows Defender policy modified" condition="contains">\Policies\Microsoft\Windows Defender</TargetObject>
+        <TargetObject name="technique_id=T1562.001,technique=Disable or Modify Tools,detection=Sysmon Autologger registry tampering" condition="contains">\Autologger\EventLog-Microsoft-Windows-Sysmon</TargetObject>
+      </RegistryEvent>
+    </RuleGroup>
+
+    <!--
+    ================================================================
+    EVENT ID 15: FILE CREATE STREAM HASH [FileCreateStreamHash]
+    ================================================================
+    -->
+    <RuleGroup name="FileCreateStreamHash" groupRelation="or">
+      <FileCreateStreamHash onmatch="include">
+        <TargetFilename name="technique_id=T1564.004|T1553.005,technique=NTFS File Attributes,detection=Executable Mark of the Web stream created" condition="end with">.exe</TargetFilename>
+        <TargetFilename name="technique_id=T1564.004|T1553.005,technique=NTFS File Attributes,detection=DLL Mark of the Web stream created" condition="end with">.dll</TargetFilename>
+        <TargetFilename name="technique_id=T1564.004|T1553.005,technique=NTFS File Attributes,detection=Batch script Mark of the Web stream created" condition="end with">.bat</TargetFilename>
+        <TargetFilename name="technique_id=T1564.004|T1553.005,technique=NTFS File Attributes,detection=Command script Mark of the Web stream created" condition="end with">.cmd</TargetFilename>
+        <TargetFilename name="technique_id=T1564.004|T1553.005,technique=NTFS File Attributes,detection=PowerShell script Mark of the Web stream created" condition="end with">.ps1</TargetFilename>
+        <TargetFilename name="technique_id=T1564.004|T1553.005,technique=NTFS File Attributes,detection=VBScript Mark of the Web stream created" condition="end with">.vbs</TargetFilename>
+        <TargetFilename name="technique_id=T1564.004|T1553.005,technique=NTFS File Attributes,detection=JavaScript Mark of the Web stream created" condition="end with">.js</TargetFilename>
+        <TargetFilename name="technique_id=T1564.004|T1553.005,technique=NTFS File Attributes,detection=HTA Mark of the Web stream created" condition="end with">.hta</TargetFilename>
+      </FileCreateStreamHash>
+    </RuleGroup>
+
+    <!--
+    ================================================================
+    EVENT ID 17, 18: NAMED PIPE EVENTS [PipeEvent]
+    ================================================================
+    -->
+    <RuleGroup name="PipeCreated" groupRelation="or">
+      <PipeEvent onmatch="exclude">
+        <PipeName name="exclude=lsass system pipe" condition="is">\lsass</PipeName>
+        <PipeName name="exclude=Workstation service pipe" condition="is">\wkssvc</PipeName>
+        <PipeName name="exclude=Server service pipe" condition="is">\srvsvc</PipeName>
+        <PipeName name="exclude=Remote registry pipe" condition="is">\winreg</PipeName>
+        <PipeName name="exclude=Print spooler pipe" condition="is">\spoolss</PipeName>
+        <!--
+        NOTE: \samr, \drsuapi, \netlogon, \epmapper are deliberately NOT excluded
+        (SAMR enum, DCSync, Zerologon context). Exclude only after reviewing volume.
+        -->
+      </PipeEvent>
+    </RuleGroup>
+
+    <!-- T1572 Protocol Tunneling + T1021.002 SMB Admin Shares + T1003.001 LSASS Memory -->
+    <RuleGroup name="PipeCreated-C2Detection" groupRelation="or">
+      <PipeEvent onmatch="include">
+        <PipeName name="technique_id=T1572|T1071,technique=Protocol Tunneling,detection=Cobalt Strike default named pipe MSSE-" condition="begin with">\MSSE-</PipeName>
+        <PipeName name="technique_id=T1572|T1071,technique=Protocol Tunneling,detection=Cobalt Strike post-exploitation pipe postex_" condition="begin with">\postex_</PipeName>
+        <PipeName name="technique_id=T1572|T1071,technique=Protocol Tunneling,detection=Cobalt Strike status pipe" condition="begin with">\status_</PipeName>
+        <PipeName name="technique_id=T1572|T1071,technique=Protocol Tunneling,detection=Cobalt Strike msagent pipe" condition="begin with">\msagent_</PipeName>
+        <PipeName name="technique_id=T1021.002|T1570,technique=SMB Admin Shares,detection=PsExec service pipe PSEXESVC" condition="is">\PSEXESVC</PipeName>
+        <PipeName name="technique_id=T1021.002|T1570,technique=SMB Admin Shares,detection=PAExec lateral movement pipe" condition="begin with">\paexec</PipeName>
+        <PipeName name="technique_id=T1021.002|T1570,technique=SMB Admin Shares,detection=RemCom lateral movement pipe" condition="begin with">\remcom</PipeName>
+        <PipeName name="technique_id=T1021.002|T1570,technique=SMB Admin Shares,detection=CSExec lateral movement pipe" condition="begin with">\csexec</PipeName>
+        <PipeName name="technique_id=T1003.001,technique=LSASS Memory,detection=Mimikatz lsadump named pipe" condition="is">\lsadump</PipeName>
+        <PipeName name="technique_id=T1003.005,technique=Cached Domain Credentials,detection=Cachedump named pipe" condition="is">\cachedump</PipeName>
+        <PipeName name="technique_id=T1003.001,technique=LSASS Memory,detection=Windows Credential Editor service pipe" condition="is">\wceservicepipe</PipeName>
+      </PipeEvent>
+    </RuleGroup>
+
+    <!--
+    ================================================================
+    EVENT ID 19, 20, 21: WMI EVENTS [WmiEvent]
+    ================================================================
+    -->
+    <RuleGroup name="WmiEvent" groupRelation="or">
+      <WmiEvent onmatch="exclude"/>
+    </RuleGroup>
+
+    <!--
+    ================================================================
+    EVENT ID 22: DNS QUERY [DnsQuery] (client-side; the DC resolving names)
+    ================================================================
+    -->
+    <RuleGroup name="DnsQuery" groupRelation="or">
+      <DnsQuery onmatch="exclude">
+        <QueryName name="exclude=Microsoft DNS query" condition="end with">.microsoft.com</QueryName>
+        <QueryName name="exclude=Windows Update DNS query" condition="end with">.windowsupdate.com</QueryName>
+        <QueryName name="exclude=Windows DNS query" condition="end with">.windows.com</QueryName>
+      </DnsQuery>
+    </RuleGroup>
+
+    <!--
+    ================================================================
+    EVENT ID 23: FILE DELETE (ARCHIVED) [FileDelete]
+    Disabled (empty include) — no archiving. Detection is via Event 26 below,
+    which logs without the disk-fill risk of archiving to C:\.
+    ================================================================
+    -->
+    <RuleGroup name="FileDelete" groupRelation="or">
+      <FileDelete onmatch="include"/>
+    </RuleGroup>
+
+    <!--
+    ================================================================
+    EVENT ID 25: PROCESS TAMPERING [ProcessTampering]
+    ================================================================
+    -->
+    <RuleGroup name="ProcessTampering" groupRelation="or">
+      <ProcessTampering onmatch="exclude"/>
+    </RuleGroup>
+
+    <!--
+    ================================================================
+    EVENT ID 26: FILE DELETE DETECTED [FileDeleteDetected] (logs, no archive)
+    ================================================================
+    -->
+    <RuleGroup name="FileDeleteDetected" groupRelation="or">
+      <FileDeleteDetected onmatch="include">
+        <TargetFilename name="technique_id=T1070.004,technique=File Deletion,detection=Executable file deleted" condition="end with">.exe</TargetFilename>
+        <TargetFilename name="technique_id=T1070.004,technique=File Deletion,detection=DLL file deleted" condition="end with">.dll</TargetFilename>
+        <TargetFilename name="technique_id=T1070.004,technique=File Deletion,detection=System driver deleted" condition="end with">.sys</TargetFilename>
+        <TargetFilename name="technique_id=T1070.004,technique=File Deletion,detection=PowerShell script deleted" condition="end with">.ps1</TargetFilename>
+        <TargetFilename name="technique_id=T1070.004,technique=File Deletion,detection=Batch script deleted" condition="end with">.bat</TargetFilename>
+        <TargetFilename name="technique_id=T1070.004,technique=File Deletion,detection=Command script deleted" condition="end with">.cmd</TargetFilename>
+        <TargetFilename name="technique_id=T1070.004|T1485,technique=File Deletion,detection=NTDS.dit deletion (forensic evidence destruction)" condition="end with">.dit</TargetFilename>
+        <TargetFilename name="technique_id=T1070.004|T1485,technique=File Deletion,detection=Registry hive file deletion (forensic evidence destruction)" condition="end with">.hive</TargetFilename>
+        <TargetFilename name="technique_id=T1490|T1485,technique=Inhibit System Recovery,detection=Backup file (.bak) deletion" condition="end with">.bak</TargetFilename>
+        <TargetFilename name="technique_id=T1490|T1485,technique=Inhibit System Recovery,detection=Virtual hard disk (.vhd) deletion" condition="end with">.vhd</TargetFilename>
+        <TargetFilename name="technique_id=T1490|T1485,technique=Inhibit System Recovery,detection=Virtual hard disk (.vhdx) deletion" condition="end with">.vhdx</TargetFilename>
+        <TargetFilename name="technique_id=T1490|T1485,technique=Inhibit System Recovery,detection=SQL Server data file (.mdf) deletion" condition="end with">.mdf</TargetFilename>
+        <TargetFilename name="technique_id=T1490|T1485,technique=Inhibit System Recovery,detection=SQL Server log file (.ldf) deletion" condition="end with">.ldf</TargetFilename>
+      </FileDeleteDetected>
+    </RuleGroup>
+
+  </EventFiltering>
+</Sysmon>
